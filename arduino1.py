@@ -33,10 +33,12 @@ mp1ontime= 5/3.25
 dp1ontime= 5/3.35
 wp1ontime= 5/4.45
 
+#control pump
 def pump_ctrl(pnum, pstate):
     ser.flush() #flush before sending signal
     ser.write(('PUMP %d %d\n' % (pnum, pstate)).encode()) #send signal telling Arduino to turn off pump 
 
+#measure OD from all arduion analog inputs
 def measure(num_cham):
     #self.ser.flush() #flush before sending signal
     ser.flushInput()
@@ -61,6 +63,7 @@ def get_currtime():
 
 start_time = get_currtime()  
 
+#code to plot data
 def plotdata(ydata):
     plt.axis([0, len(ydata), 0, 1000])
     plt.ion()
@@ -70,20 +73,21 @@ def plotdata(ydata):
 
     plt.pause(.0000000001)
 
+#morbidostat algorithm, set to trigger pumps and keep them on according to calibrated time
 def cycloresistron(): 
-        if (loop_count % addmediafreq)==0:
-            if np.mean(ydata[-avgnum:-1]) >400:
-                pump_ctrl(drugpump1,1)
-                threading.Timer(dp1ontime,pump_ctrl(drugpump1,0)).start()
-                threading.Timer(dp1ontime,pump_ctrl(wastepump1,1)).start()
-                threading.Timer(wp1ontime,pump_ctrl(wastepump1,0)).start()
-                
-            else: 
-                pump_ctrl(mediapump1,1)
-                threading.Timer(mp1ontime,pump_ctrl(drugpump1,0)).start()
-                threading.Timer(dp1ontime,pump_ctrl(wastepump1,1)).start()
-                threading.Timer(wp1ontime,pump_ctrl(wastepump1,0)).start()
-        else:
+    if (loop_count % addmediafreq)==0:
+        if np.mean(ydata[-avgnum:-1]) >400:
+            pump_ctrl(drugpump1,1)
+            threading.Timer(dp1ontime,pump_ctrl(drugpump1,0)).start()
+            threading.Timer(dp1ontime,pump_ctrl(wastepump1,1)).start()
+            threading.Timer(wp1ontime,pump_ctrl(wastepump1,0)).start()
+            
+        else: 
+            pump_ctrl(mediapump1,1)
+            threading.Timer(mp1ontime,pump_ctrl(drugpump1,0)).start()
+            threading.Timer(dp1ontime,pump_ctrl(wastepump1,1)).start()
+            threading.Timer(wp1ontime,pump_ctrl(wastepump1,0)).start()
+
 
 start_time = get_currtime()          
 loop_count = 0
@@ -92,11 +96,13 @@ avgnum = 5
 wastetime = 5
 while 1:
     #arduinoData  = str(np.round(np.random.rand()*50 + 950).astype(int))
+    #measure OD from 1st channel only for know
     arduinoData = measure(16)[0]
     #arduinoData = ser.readline().decode('ascii')
     #print(data)
     #arduinoData=(measure(1).decode('ascii'))
     
+    #format data something something
     if(len(arduinoData) > 0):
         arduinoData = int(arduinoData)
     else:
@@ -104,12 +110,14 @@ while 1:
     #print(arduinoData)
 
     ydata.append(arduinoData) 
-    pump_ctrl(drugpump1,0)
-    pump_ctrl(mediapump1,0)
-    pump_ctrl(wastepump1,0)
+    #pump_ctrl(drugpump1,0)
+    #pump_ctrl(mediapump1,0)
+    #pump_ctrl(wastepump1,0)
     
+    #we only want the morbidostat algorithm to run every 2 seconds, but this is not the way to do t
     threading.Timer(2,cycloresistron()).start()
     loop_count += 1
+    #run plot function for every iteration
     plotdata(ydata)
 
 
