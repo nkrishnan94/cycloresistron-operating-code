@@ -73,7 +73,14 @@ def plotdata(ydata):
 
     plt.pause(.0000000001)
 
+
+start_time = get_currtime()          
+loop_count = 0
+addmediafreq = 30
+avgnum = 5
 #morbidostat algorithm, set to trigger pumps and keep them on according to calibrated time
+
+
 def cycloresistron(): 
     if (loop_count % addmediafreq)==0:
         if np.mean(ydata[-avgnum:-1]) >400:
@@ -89,12 +96,10 @@ def cycloresistron():
             threading.Timer(wp1ontime,pump_ctrl(wastepump1,0)).start()
 
 
-start_time = get_currtime()          
-loop_count = 0
-addmediafreq = 30
-avgnum = 5
-wastetime = 5
-while 1:
+#how many loops this should run for
+endloops =100 
+#recursive loop function thing
+def on_timer():
     #arduinoData  = str(np.round(np.random.rand()*50 + 950).astype(int))
     #measure OD from 1st channel only for know
     arduinoData = measure(16)[0]
@@ -113,11 +118,16 @@ while 1:
     #pump_ctrl(drugpump1,0)
     #pump_ctrl(mediapump1,0)
     #pump_ctrl(wastepump1,0)
-    
+    cycloresistron()
     #we only want the morbidostat algorithm to run every 2 seconds, but this is not the way to do t
-    threading.Timer(2,cycloresistron()).start()
+    if loop_count != endloops:
+        threading.Timer(2,on_timer).start()
+    
     loop_count += 1
     #run plot function for every iteration
     plotdata(ydata)
+
+
+
 
 
