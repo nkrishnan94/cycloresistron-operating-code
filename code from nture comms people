@@ -1,0 +1,914 @@
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#                                                                                 Time-stamp: <Mon Mar 23 10:25:06 GMT Standard Time 2015>
+#
+#    morbidostat_control.py
+#        --- Controls morbidostat using Arduino MEGA. 
+#             
+#
+#    (c) Soichiro Tsuda (Soichiro.Tsuda@glasgow.ac.uk), University of Glasgow 
+# 
+#
+#   Requirements: 
+#     An easy way to install required modules for this code is to install Python(x,y)
+#     https://code.google.com/p/pythonxy/ 
+#     Alternatively, you can install following python/modules by yourself
+#      - Python 2.7
+#      - PyQt4
+#      - PySerial 
+#      - NumPy
+#      - tabulate (can be installed via pip after you install Python (x,y))
+#      - Phidgets module http://www.phidgets.com/docs/Language_-_Python
+#
+#            
+#   How to run:          
+#     If you'd like to save all outputs by 'print' command, you can run python with -u option (on cygwin or linux terminal)
+#       python -u <filename>.py | tee log-file.txt
+#     (cf. http://superuser.com/questions/569003/cygwin-mintty-failing-to-update-terminal-output-properly)
+#            
+#
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+
+import sys,os,csv
+import time
+import datetime
+import random
+import numpy as np
+import threading
+#import serial
+from tabulate import tabulate
+from functools import partial
+
+# GUI related imports
+from PyQt4.QtCore import *
+from PyQt4.QtGui import *
+import matplotlib
+from matplotlib.backends.backend_qt4agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt4agg import NavigationToolbar2QTAgg as NavigationToolbar
+from matplotlib.figure import Figure
+
+# import from local file (Arduino.py and Tricontinent.py). 
+# Make sure you have them in the same folder. 
+from Arduino import Arduino
+
+# --------------------------------------------------------------------------------------------------
+#   C O N S T A N T S
+# --------------------------------------------------------------------------------------------------
+
+# Use custom-made Arduino shield?
+#  0: No. Use Phidgets to control growth light (LED strips) / waste pumps instead
+#  1: Yes.
+use_shield_pump = 1
+
+# arduino port 
+arduino_port = str(sys.argv[1]) if len(sys.argv) >= 2 else 'COM8'
+arduino2_port = str(sys.argv[2]) if len(sys.argv) >= 3 else 'COM12'
+# baudrate for arduino
+arduino_baud = 115200   #  Chlorophyll probes 
+
+
+# Sampling rate --- how often read voltage from arduino/NI-DAQ 
+sampling_rate = 2 #sec (minimum =1) 
+
+# OD threshold (a.u.) 
+defaultOD_threshold =  0.5
+
+# OD average length --- to smooth measured OD/voltage values 
+# Unit: samples 
+OD_av_length = 30
+
+# number of chambers --- how many flasks/bottles are you gonna use? 
+num_cham = 16
+
+# Chart history length
+chart_length = 8640 # = 24h display with every 10s sampling rate
+
+
+
+# ---- Morbidostat specific constants ----------------------------------------------------------------
+
+# Infusion pump OFF duration --- How long an infusion pump is kept ON after addition of fresh media 
+mstat_pump_OFF_duration = 50 #sec 
+# Waste pump ON duration  120
+mstat_wpump_ON_duration = 120
+# Waste pump OFF duration  60
+mstat_wpump_OFF_duration = 80
+
+# Frequency to add fresh media 
+mstat_addmedia_freq_min = 12     # (in minutes) 12
+mstat_addmedia_freq = mstat_addmedia_freq_min * 60 / sampling_rate  # (in updates, not seconds!) 
+
+
+# Mapping for arduino pin - ver.1 shield pin 
+#
+# Organge pump #1-8 = [13, 12, 11, 10, 9, 29, 28, 27]
+# Green pump #1-8 = [49, 48, 47, 45, 44, 43, 46, 35]
+# Yellow pump #1-8 = [26, 22, 23, 24, 25, 31, 33]
+# Pink pump #1-8 = [36, 37, 38, 39, 40, 41, 42, 32]
+
+# pin assigments for peristaltic pumps connected to drug media
+# shield_drugpump_pin = [5, 4, 3, 2, 18, 19, 20, 21, 32, 34, 36, 38, 50, 52, 53, 51]
+shield_drugpump_pin = [5, 4, 3, 2, 18, 19, 20, 21, 32, 34, 36, 38, 50, 52, 53, 51]
+
+# pin assigments for peristaltic pumps connected to fresh media (no drug)
+shield_mediapump_pin = [9, 8, 7, 6, 14, 15, 16, 17, 24, 26, 28, 30, 42, 44, 46, 48]
+ 
+
+# pin connected to waste pump 
+shield_wastepump_pin = 29
+
+# pin connected to LED/sensor set on the *second* arduino 
+shield_LEDsensor_pin = [15, 16, 17, 18]
+
+# default OD threshold:
+#  Each vessel gives different voltage ing for an OD (e.g. OD=0.3).
+#  To correct such variation, here we set different target OD for
+#  drug/fresh media decision
+
+
+
+mstat_defaultOD_thresh = [1.08, 1.12, 1.06, 1.01, 1.00, 1.13, 1.15, 1.12, 1.12, 1.14, 1.24, 1.09, 1.00, 1.01, 1.08, 1.10]
+
+
+# Lower OD threshold:
+#  This threshold is set to avoid washing out cells by too much dilution
+mstat_lowerOD_thresh = [0.93, 0.94, 0.95, 0.92, 0.92, 0.95, 0.95, 0.96, 0.95, 0.96, 0.97, 0.94, 0.92, 0.92, 0.95, 0.94]
+
+
+# You can also set OD individually, like [0.05, 0.04, ... ]  
+# mstat_lowerOD_thresh = [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01] # You can also set OD individually, like [0.05, 0.04, ... ]  
+
+
+# Plot data mode:
+#   1: current OD value (not averaged)
+#   0: averaged OD value 
+plot_data_mode = 1 
+
+# --------------------------------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------------------------------
+#   C L A S S    D E F I N I T I O N
+# --------------------------------------------------------------------------------------------------
+
+class Morbidostat(QMainWindow):
+    
+    def __init__(self, parent=None):
+
+        # --------------------------------------------------------------------------------------------------
+        #   Instance variables   
+        # --------------------------------------------------------------------------------------------------
+
+        # initial voltage value 
+        self.initVolt = np.zeros(num_cham)
+        #tmpVolt = self.arduino.poll()
+        #self.initVolt = np.asarray(tmpVolt)
+        print("OD: initial voltages are set to "), self.initVolt
+        # currentl voltage value 
+        self.currVolt = np.zeros(num_cham)
+        # current OD value 
+        self.currOD = np.zeros(num_cham)
+        # averaged OD value 
+        self.avOD = np.zeros(num_cham)
+        # OD averaging buffer 
+        self.avOD_buffer = np.zeros((OD_av_length, num_cham))
+        # Last time when fresh media was added 
+        self.last_update = [0] * num_cham
+        # count the num of loops for on_timer()
+        self.loop_count = 0
+        # OD level check
+        #self.OD_thresh = [defaultOD_threshold] * num_cham    # assuming up to 16 chambers
+        self.OD_thresh = mstat_defaultOD_thresh
+
+        # system running status
+        self.system_running = False 
+
+        # Waste pump state
+        self.pump_state = [False] * num_cham # assuming up to num_cham chambers
+        
+        # plot data
+        self.plot_data = np.zeros((1, num_cham))
+
+        # set start time for the experiment 
+        self.start_time = self.get_currtime()        
+
+        # dilution counter: count how many times fresh media were added
+        self.dilution_count = np.zeros(num_cham)
+        self.drugmedia_dilution_count = np.zeros(num_cham)
+        self.freshmedia_dilution_count = np.zeros(num_cham)
+
+        # display when it was diluted last 
+        self.last_dilution = [self.get_currtime()] * num_cham
+        # history of dilution time 
+        self.dilution_record = []
+        for i in range(1,num_cham+1):
+            self.dilution_record.append([])
+
+        self.last_dilutionOD = [0] * num_cham
+
+        # --------------------------------------------------------------------------------------------------
+        #   Initialising functions 
+        # --------------------------------------------------------------------------------------------------
+
+        # initialise GUI window
+        QMainWindow.__init__(self, parent)
+        self.setWindowTitle(' Arduino Morbidostat Controller ')
+
+        # Connect to arduino
+        self.init_arduino()
+        #self.arduino_attached = False
+
+        # generate window
+        self.create_main_panel()
+
+
+        # --------------------------------------------------------------------------------------------------
+        #   Data logging 
+        # --------------------------------------------------------------------------------------------------
+
+        # output file name for data logging
+        self.output_file = "morbidostat-data-%d%.2d%.2d-%.2d%.2d.csv" % (self.start_time.year, self.start_time.month, self.start_time.day, self.start_time.hour, self.start_time.minute) 
+        self.pump_output_file = "morbidostat-pumplog-%d%.2d%.2d-%.2d%.2d.csv" % (self.start_time.year, self.start_time.month, self.start_time.day, self.start_time.hour, self.start_time.minute) 
+        self.final_output_file = "morbidostat-finalODlog-%d%.2d%.2d-%.2d%.2d.csv" % (self.start_time.year, self.start_time.month, self.start_time.day, self.start_time.hour, self.start_time.minute) 
+
+        # Save parameters 
+        # make sure you open a CSV file in *binary* mode! 
+        # see http://stackoverflow.com/questions/4249185/using-python-to-append-csv-files
+        file = open(self.output_file, 'ab')
+        file.write("# ------------------------------------------------------------------------------------------------------------------------\n")
+        file.write("# %s  \n#\n" % self.output_file)
+        file.write("# Date: %s \n#\n" % self.start_time)
+        file.write("# ----- MEASUREMENT DATA ---------------------------------\n#\n")
+        for i in range(0,num_cham):
+            file.write("#%d voltage, #%d curr. OD, #%d av. OD, " % (i,i,i))
+        file.write(" Loop count, Date&time, Elapsed time")
+        file.write(" \n")
+        file.close()
+        # pump output
+        file = open(self.pump_output_file, 'ab')
+        file.write("# ------------------------------------------------------------------------------------------------------------------------\n")
+        file.write("# %s  \n#\n" % self.output_file)
+        file.write("# Date: %s \n#\n" % self.start_time)
+        file.write("# ----- MEASUREMENT DATA ---------------------------------\n#\n")
+        file.write("# Dilution count, ")
+        for i in range(0,num_cham):
+            file.write("#%d vessel, " % i)
+        file.write(" Loop count, Date&time, Elapsed time")
+        file.write(" \n")
+        file.close()
+        # final OD output
+        file = open(self.final_output_file, 'ab')
+        file.write("# ------------------------------------------------------------------------------------------------------------------------\n")
+        file.write("# %s  \n#\n" % self.output_file)
+        file.write("# Date: %s \n#\n" % self.start_time)
+        file.write("# ----- MEASUREMENT DATA ---------------------------------\n#\n")
+        file.write("# Dilution count, ")
+        for i in range(0,num_cham):
+            file.write("#%d vessel pump state, #%d vessel current OD, #%d vessel average OD, " % (i, i, i))
+        file.write(" Loop count, Date&time, Elapsed time")
+        file.write(" \n")
+        file.close()
+
+
+        # output file name for logs
+        # Currently, log file is recorded by redirecting stdout to a file by tee command 
+        #self.log_file = "tubidostat-log-%d%d%d%d%d.txt" % (self.start_time.year, self.start_time.month, self.start_time.day, self.start_time.hour, self.start_time.minute) 
+
+        # Flush out all stdout. This is needed when run on cygwin. 
+        # see http://stackoverflow.com/questions/3250749/using-windows-python-from-cygwin
+        sys.stdout.flush() 
+
+
+    def init_arduino(self):
+        try:
+            self.arduino = Arduino(arduino_port, arduino_baud)
+            self.arduino_attached = True 
+        except:
+            print('ARDUINO: unable to connect to arduino')
+            exit(1)
+
+        try:
+            self.arduino2 = Arduino(arduino2_port, arduino_baud)
+            self.arduino2_attached = True 
+        except:
+            print('ARDUINO: unable to connect to arduino2')
+            exit(1)
+
+
+    def init_plot(self):
+        # self.plotMem = chart_length # how much data to keep on the plot
+        # self.plotData = [[0] * 8] # mem storage for plot
+
+        # there's nothing to do in particular here at the moment
+        pass     
+
+
+    # Convenient functions for vertical and horizontal lines.
+    # Used in create_main_panel()
+    # ref. http://stackoverflow.com/questions/5671354/how-to-programmatically-make-a-horizontal-line-in-qt
+    def HLine(self):
+        toto = QFrame()
+        toto.setFrameShape(QFrame.HLine)
+        toto.setFrameShadow(QFrame.Sunken)
+        return toto
+
+    def VLine(self):
+        toto = QFrame()
+        toto.setFrameShape(QFrame.VLine)
+        toto.setFrameShadow(QFrame.Sunken)
+        return toto
+
+    def create_main_panel(self):
+        self.main_frame = QWidget()
+        #self.main_frame.setWindowTitle(' Arduino Multistat Controller ')
+
+        ## ------------------------------------------------------
+        ##    create plot 
+        ## ------------------------------------------------------
+        self.dpi = 50
+        self.fig = Figure((10,12), dpi=self.dpi)
+        self.fig.patch.set_facecolor('white')
+        # create initial plot data 
+        self.init_plot()
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setParent(self.main_frame)
+
+        self.axes = []
+        self.lines = []
+        for i in range(1,num_cham+1):
+            self.axes.append(self.fig.add_subplot(num_cham/4,4,i))
+        self.fig.tight_layout()
+
+        # Create the navigation toolbar, tied to the canvas
+        self.mpl_toolbar = NavigationToolbar(self.canvas, self.main_frame)
+
+
+        ## ------------------------------------------------------
+        ##    create pump control 
+        ## ------------------------------------------------------
+        self.pumpctrl_label = QLabel('Peristaltic Pump Command: ')
+        # command text box 
+        self.sendcmd_textctrl = QLineEdit()
+        self.sendcmd_textctrl.setMinimumWidth(60)
+        self.sendcmd_textctrl.setText('PUMP 0 0')
+        # send cmd button
+        self.btn_sendcmd = QPushButton("Send cmd")
+        self.connect(self.btn_sendcmd, SIGNAL('clicked()'), self.on_btn_sendcmd)
+
+        # Pump control method 
+        # Waste pump toggle button
+        self.pump_label = QLabel('Pump State: ')
+        self.btn_pump = QPushButton("All ON/OFF")
+        self.btn_pump_state = False
+        self.connect(self.btn_pump, SIGNAL('clicked()'), self.on_btn_pump)
+        # Control each waste pump
+        self.pump_cbox = []
+        for i in range(0, 54):
+            self.pump_cbox.append(QCheckBox(str(i)))
+            self.pump_cbox[i].setChecked(False)
+            self.pump_cbox[i].stateChanged.connect(partial(self.on_cbox_update, i))
+            #self.pump_cbox[i].stateChanged.connect(lambda: self.on_cbox_update(1))
+
+
+        ## ------------------------------------------------------
+        ##    create OD threshold boxes 
+        ## ------------------------------------------------------
+
+        # Label
+        self.OD_label = QLabel('OD Settings: ')
+        # spinbox: flask number
+        self.flasknum1_label = QLabel('Flask #')
+        self.sb_ODthresh = QSpinBox()
+        self.sb_ODthresh.setRange(1,num_cham)
+        # textcontrol: OD threshold value
+        self.ODthresh_label = QLabel('Threshold')
+        self.ODthresh_textctrl = QLineEdit()
+        self.ODthresh_textctrl.setMaximumWidth(60)
+        self.ODthresh_textctrl.setText(str(defaultOD_threshold))
+        # button: set OD threshold 
+        self.btn_ODthresh = QPushButton("Set OD")
+        self.connect(self.btn_ODthresh, SIGNAL('clicked()'), self.on_btn_ODthresh)
+
+
+        ## ------------------------------------------------------
+        ##    create morbidostat configuration stuff
+        ## ------------------------------------------------------
+
+        self.param_label = QLabel('OD thresholds  ')
+        self.ODthresh_textarea = []
+        self.ODthresh_label = []
+        for i in range(0, num_cham):
+            self.ODthresh_label.append(QLabel('#%d'%(i+1)))
+            self.ODthresh_textarea.append(QLineEdit())
+            self.ODthresh_textarea[i].setMaximumWidth(50)
+            self.ODthresh_textarea[i].setText('0.5')
+
+        # dilution perdio
+        self.dil_period_label = QLabel('Dilution Period (min)')
+        self.dil_period_textarea = QLineEdit()
+        self.dil_period_textarea.setMaximumWidth(40)
+        self.dil_period_textarea.setText('12')
+
+        # Media/drug pump ON duration
+        self.mpump_duration_label = QLabel('Media pump ON duration (sec)')
+        self.mpump_duration_textarea = QLineEdit()
+        self.mpump_duration_textarea.setMaximumWidth(40)
+        self.mpump_duration_textarea.setText(str(mstat_pump_OFF_duration))
+
+        # waste pump - how long you wait before waste pump starts
+        self.wpump_wait_label = QLabel('W-pump wait (sec)')
+        self.wpump_wait_textarea = QLineEdit()
+        self.wpump_wait_textarea.setMaximumWidth(40)
+        self.wpump_wait_textarea.setText(str(mstat_wpump_ON_duration))
+        # waste pump - how long waste pump runs to suck waste 
+        self.wpump_duration_label = QLabel('W-pump ON duration (sec)')
+        self.wpump_duration_textarea = QLineEdit()
+        self.wpump_duration_textarea.setMaximumWidth(40)
+        self.wpump_duration_textarea.setText(str(mstat_wpump_OFF_duration))
+
+        self.fanspeed_label = QLabel('Fan Speed:')
+        self.fanspeed_sb = QSpinBox()
+        self.fanspeed_sb.setRange(0,255)
+        self.fanspeed_sb.setValue(255)
+        self.connect(self.fanspeed_sb, SIGNAL('valueChanged(int)'), self.on_sb_fanspeed)
+
+        self.LEDsensor_label = QLabel('     LED/sensor Control:')
+        # Control each waste pump
+        self.LEDsensor_cbox = []
+        for i in range(0, 4):
+            self.LEDsensor_cbox.append(QCheckBox(str(i+1)))
+            self.LEDsensor_cbox[i].setChecked(False)
+            self.LEDsensor_cbox[i].stateChanged.connect(partial(self.on_cbox_LEDsensor, i))
+            #self.pump_cbox[i].stateChanged.connect(lambda: self.on_cbox_update(1))
+
+        ## ------------------------------------------------------
+        ##    create morbidostat start button
+        ## ------------------------------------------------------
+
+        # Start button to start experiment 
+        self.btn_start = QPushButton("START")
+        self.btn_start.setMinimumWidth(150)
+        self.connect(self.btn_start, SIGNAL('clicked()'), self.on_btn_start)
+        self.btn_start.setStyleSheet("font: 10pt bold; color: red; background-color: #E9E9E9; border-width: 2px")
+        #self.btn_start.setStyleSheet("QPushButton { font: 10pt; color: red; background-color: #e9e9e9; border-width: 2px }"
+        # "QPushButton:pressed { background-color: #c8c8c8 }") # light gray 
+
+        
+        ## ------------------------------------------------------
+        ##   Layout widgets with box sizers
+        ## ------------------------------------------------------
+        hbox0 = QHBoxLayout()
+        for w in [  self.pumpctrl_label, self.sendcmd_textctrl, self.btn_sendcmd]:
+            hbox0.addWidget(w)
+            hbox0.setAlignment(w, Qt.AlignVCenter)
+
+        hbox1 = QHBoxLayout()
+        for w in [  self.pump_label, self.btn_pump]:
+            hbox1.addWidget(w)
+            hbox1.setAlignment(w, Qt.AlignVCenter)
+        for i in range(0,16):
+            hbox1.addWidget(self.pump_cbox[i])
+            hbox1.setAlignment(w, Qt.AlignVCenter)
+
+        hbox2 = QHBoxLayout()
+        for i in range(16,35):
+            hbox2.addWidget(self.pump_cbox[i])
+            hbox2.setAlignment(w, Qt.AlignVCenter)
+
+        hbox3 = QHBoxLayout()
+        for i in range(35, 54):
+            hbox3.addWidget(self.pump_cbox[i])
+            hbox3.setAlignment(w, Qt.AlignVCenter)
+
+        hbox5 = QHBoxLayout()
+        #for w in [self.param_label]:
+        #    hbox5.addWidget(w)
+        #    hbox5.setAlignment(w, Qt.AlignVCenter)
+        #for i in range(0, num_cham):
+        #    hbox5.addWidget(self.ODthresh_label[i])
+        #    hbox5.setAlignment(self.ODthresh_label[i], Qt.AlignVCenter)
+        #    hbox5.addWidget(self.ODthresh_textarea[i])
+        #    hbox5.setAlignment(self.ODthresh_textarea[i], Qt.AlignVCenter)
+        for w in [self.fanspeed_label, self.fanspeed_sb, self.LEDsensor_label]:
+            hbox5.addWidget(w)
+            hbox5.setAlignment(w, Qt.AlignVCenter)
+        for i in range(0, 4):
+            hbox5.addWidget(self.LEDsensor_cbox[i])
+            hbox5.setAlignment(w, Qt.AlignVCenter)
+
+        hbox6 = QHBoxLayout()
+        for w in [self.dil_period_label, self.dil_period_textarea, self.mpump_duration_label, self.mpump_duration_textarea, self.wpump_wait_label, self.wpump_wait_textarea, self.wpump_duration_label,self.wpump_duration_textarea]:
+            hbox6.addWidget(w)
+            hbox6.setAlignment(w, Qt.AlignVCenter)
+
+        hbox4 = QHBoxLayout()
+        hbox4.addSpacing(500)
+        hbox4.addWidget(self.btn_start)
+        hbox4.setAlignment(self.btn_start, Qt.AlignRight)
+        hbox4.setAlignment(self.btn_start, Qt.AlignVCenter)
+        
+
+        # placing boxes
+        vbox = QVBoxLayout()
+        vbox.addLayout(hbox0)
+        vbox.addWidget(self.HLine())
+        vbox.addLayout(hbox1)
+        vbox.addWidget(self.HLine())
+        vbox.addLayout(hbox2)
+        vbox.addWidget(self.HLine())
+        vbox.addLayout(hbox3)
+        vbox.addWidget(self.HLine())
+        vbox.addLayout(hbox5)
+        vbox.addWidget(self.HLine())
+        #vbox.addLayout(hbox6)
+        #vbox.addWidget(self.HLine())
+        vbox.addLayout(hbox4)
+        vbox.addWidget(self.HLine())
+        vbox.addWidget(self.canvas)
+        vbox.addWidget(self.mpl_toolbar)
+        
+        self.main_frame.setLayout(vbox)
+        self.setCentralWidget(self.main_frame)
+
+        time.sleep(1)
+        # Timer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.on_timer)
+        self.rate = sampling_rate * 1000
+        self.timer.start(self.rate)
+
+
+
+    def measure_OD(self):
+        # This function first receives sensory data from arduino (currVolt).
+        # Then convert it to OD value (currOD) and  calculate moving average (avOD).  
+        if self.arduino_attached:
+            # read voltage from arduino --- measure() gives all 16ch readings
+            tmpVolt = self.arduino2.measure(num_cham)
+            print("OD: current voltage (raw) = ", np.asarray(tmpVolt)[0:num_cham])
+            #print self.initVolt
+            #print np.asarray(tmpVolt)
+            #self.currVolt = self.initVolt - np.asarray(tmpVolt)
+            self.currVolt = np.asarray(tmpVolt)
+        else:
+            # For test: generate random number 
+            self.currVolt = np.ones(num_cham)
+            for i in range(0, num_cham):
+                self.currVolt[i] = self.currVolt[i] + random.random()*2
+
+        # ------------------------------------------
+        #   Process the data
+        # ------------------------------------------
+        # convert Voltage into OD 
+        self.currOD = self.currVolt  # NEEDS IMPLEMNTATION 
+        # add current OD value to OD buffer.
+        self.avOD_buffer = np.append(self.avOD_buffer, self.currOD.reshape(1,num_cham), axis=0)  
+        # then remove the first item in the array, i.e. the oldest 
+        self.avOD_buffer = np.delete(self.avOD_buffer, 0, axis=0)          
+        # calculate average for each flask
+        self.avOD = np.mean(self.avOD_buffer, axis=0)
+   
+
+    def morbidostat(self):
+        # check OD level every XX updates. 
+        if (self.loop_count % mstat_addmedia_freq) == 0: 
+            # open pump output log 
+            file = open(self.pump_output_file, 'ab') 
+            fileOD = open(self.final_output_file, 'ab') 
+            tmplist = [self.dilution_count[0]]
+            tmplistOD = [self.dilution_count[0]]
+            for i in range(0, num_cham):        
+                # Make sure current OD is above the lower threshold (to avoid cells being washed out)
+                if self.avOD[i] > mstat_lowerOD_thresh[i]:
+                    # check following things to decide which media to add (drug or no drug media) 
+                    #  - current OD is above threshold
+                    #  - current OD is above the last OD when diluted
+                    if self.avOD[i] > self.OD_thresh[i] and self.avOD[i] > self.last_dilutionOD[i]:
+                        # Add drug media 
+                        self.add_drugmedia(i) # NEEDS CHECK
+                        self.drugmedia_dilution_count[i] += 1
+                        print("MORBIDOSTAT: Adding drug media as avOD[%d] = %f exceeds OD threshold (%f) @ %s, loop_count = %d" % (i, self.avOD[i], self.OD_thresh[i], str(self.get_currtime()), self.loop_count)) 
+                        # append to pump output log
+                        tmplist.append(1)
+                        # append to final OD output log
+                        tmplistOD = tmplistOD + [1, self.currOD[i], self.avOD[i]]
+                    else:
+                        # Add fresh media (no drug)
+                        self.add_freshmedia(i) # NEEDS CHECK
+                        self.freshmedia_dilution_count[i] += 1
+                        print("MORBIDOSTAT: Adding fresh media as avOD[%d] = %f is below the OD threshold (%f) @ %s, loop_count = %d" % (i, self.avOD[i], self.OD_thresh[i], str(self.get_currtime()), self.loop_count)) 
+                        # append to pump output log
+                        tmplist.append(0)
+                        # append to final OD output log
+                        tmplistOD = tmplistOD + [0, self.currOD[i], self.avOD[i]]
+                    self.last_dilutionOD[i] = self.avOD[i]
+                    self.last_update[i] = self.loop_count
+                    self.dilution_count[i] += 1
+                    self.last_dilution[i] = self.get_currtime()
+            
+                else: # case when  OD is below lower OD threshold
+                    print("MORBIDOSTAT: avOD[%d] = %f is below the lower OD threshold (%f). No dilution for now.  @ %s, loop_count = %d" % (i, self.avOD[i], mstat_lowerOD_thresh[i], str(self.get_currtime()), self.loop_count)) 
+
+            # save pump output log
+            tmplist.append(self.loop_count)
+            tmplist.append(self.get_currtime().strftime("%Y-%m-%d %H:%M:%S"))
+            elapsed_time = self.get_currtime() - self.start_time
+            tmplist.append(str(elapsed_time))
+            wr = csv.writer(file)
+            wr.writerow(tmplist)
+            file.close()
+            # save final OD output log
+            tmplistOD.append(self.loop_count)
+            tmplistOD.append(self.get_currtime().strftime("%Y-%m-%d %H:%M:%S"))
+            elapsed_time = self.get_currtime() - self.start_time
+            tmplistOD.append(str(elapsed_time))
+            wr = csv.writer(fileOD)
+            wr.writerow(tmplistOD)
+            fileOD.close()
+
+            # set all infusion pump OFF after XX seconds
+            t_off=threading.Timer(mstat_pump_OFF_duration, self.pump_all_off)
+            t_off.start()
+            print("All the pump is going to be turned off after %ds....") % mstat_pump_OFF_duration
+
+            # turn waste pump ON after YY seconds
+            t_wpmp_on=threading.Timer(mstat_wpump_ON_duration, self.pump_ctrl, [shield_wastepump_pin, 1])
+            t_wpmp_on.start()
+            # turn waste pump ON after YY seconds
+            t_wpmp_off=threading.Timer(mstat_wpump_ON_duration+mstat_wpump_OFF_duration, self.pump_ctrl, [shield_wastepump_pin, 0])
+            t_wpmp_off.start()
+            
+
+
+    def pump_all_off(self):
+        print("PUMP: Turning all pump OFF @ %s")  % self.get_currtime()
+        # change pump state
+        self.arduino.pump_alloff()
+        # update checkboxes
+        #for i in range(0, 54):
+        #    self.pump_cbox[i].setChecked(False)
+        
+    def pump_all_on(self):
+        print "PUMP: Turning all pump ON @ %s"  % self.get_currtime()
+        # change pump state
+        self.arduino.pump_allon()
+        # update checkboxes
+        #for i in range(0, 54):
+        #    self.pump_cbox[i].setChecked(True)
+        
+
+    def pump_ctrl(self,pnum, pstate): 
+        if pstate: 
+            print "PUMP: Turning No.%d pump ON @ %s"  % (pnum, self.get_currtime())
+        else: 
+            print "PUMP: Turning No.%d pump OFF @ %s"  % (pnum, self.get_currtime())
+
+        # change pump state
+        self.arduino.pump_ctrl(pnum, pstate)
+
+
+    def add_freshmedia(self,flasknum): 
+        # turn on infusion pump 
+        self.pump_ctrl(shield_mediapump_pin[flasknum], 1)
+
+    def add_drugmedia(self,flasknum): 
+        # turn on infusion pump 
+        self.pump_ctrl(shield_drugpump_pin[flasknum], 1)
+
+
+    def draw_plot(self):
+        # append a new vector and delete the oldest one 
+        #print "plot_data =", self.plot_data
+        #print "currOD.reshap", self.currOD.reshape(1,4)
+        if plot_data_mode: # plot current OD (not averaged)
+            self.plot_data = np.append(self.plot_data, self.currOD.reshape(1,num_cham), axis=0)  
+        else: 
+            self.plot_data = np.append(self.plot_data, self.avOD.reshape(1,num_cham), axis=0)  
+
+        # set xbound
+        if len(self.plot_data) > chart_length:
+            # remove the first item which is out of bound
+            self.plot_data = np.delete(self.plot_data, 0, axis=0)  
+            xmax = len(self.plot_data) 
+            xmin = xmax - chart_length
+        else:
+            xmax = len(self.plot_data) 
+            xmin = 0
+        # set x range 
+        xrange = np.arange(xmin, xmax)
+
+        
+        for i in range(0,num_cham):
+            # set ybound
+            ymax = np.amax(self.plot_data[:,i]) + 0.01
+            ymin = np.amin(self.plot_data[:,i]) - 0.01
+
+            # plot data after scaled to 0-5V 
+            #self.axes[i].plot(self.plot_data[:,i*2],'b', self.plot_data[:,i*2+1],'r')
+            self.axes[i].plot(xrange, self.plot_data[:,i])
+            self.axes[i].set_xticks([xmin, xmax/4, xmax/2, 3*xmax/4, xmax])
+            self.axes[i].hold(False)  # this avoids plot slows down
+             # set xbound
+            self.axes[i].set_xbound(lower=0, upper=len(self.plot_data))        
+             # set ybound 
+            self.axes[i].set_ybound(lower=ymin, upper=ymax)        
+
+        # draw
+        self.canvas.draw()
+
+
+    def get_currtime(self):
+        ## convenient function to get current time 
+        return datetime.datetime.now().replace(microsecond=0)
+
+    def save(self, data):     
+        # make sure you open a CSV file in *binary* mode! 
+        # see http://stackoverflow.com/questions/4249185/using-python-to-append-csv-files
+        file = open(self.output_file, 'ab') 
+        tmplist = []
+        for i in range(0,num_cham):
+            tmplist.append(self.currVolt[i])
+            tmplist.append(self.currOD[i])
+            tmplist.append(self.avOD[i])
+        tmplist.append(self.loop_count)
+        tmplist.append(self.get_currtime().strftime("%Y-%m-%d %H:%M:%S"))
+        elapsed_time = self.get_currtime() - self.start_time
+        tmplist.append(str(elapsed_time))
+        wr = csv.writer(file)
+        wr.writerow(tmplist)
+        file.close()
+    
+    def display_data(self):
+        # Table output of measurement results 
+        self.taboutput = []
+        print ""
+        elapsed_time = self.get_currtime() - self.start_time
+        for i in range(0,num_cham):
+            tmplist = ["#%d"%(i+1), self.currVolt[i], self.currOD[i], self.avOD[i], self.loop_count, self.dilution_count[i], self.drugmedia_dilution_count[i], self.freshmedia_dilution_count[i], self.get_currtime().strftime("%Y-%m-%d %H:%M:%S"), str(elapsed_time)]
+            self.taboutput.append(tmplist)
+        print tabulate(self.taboutput, headers=["Chamber", "Voltage", "Curr. OD", "Av. OD", "Loop count", "Dilution count", "Drug media dilution count", "Fresh media dilution count", "Current time", "Elapsed time"])
+        print ""
+        
+
+    #
+    # --- Loop function  -----------------------------------------------------------------------------------------------------
+    # 
+    def on_timer(self):
+
+        print "TIME: ", self.get_currtime()
+        print "TIME: elapsed time = ", self.get_currtime() - self.start_time
+        print "TIME: loop_count = %d" % self.loop_count
+
+        # Run OD measurement periodically
+        self.measure_OD()
+        #print "OD: avOD = ", self.avOD[:]
+
+        # Output data in table format
+        self.display_data()
+
+        # plot data
+        self.draw_plot()
+
+        if self.system_running:
+
+            # save data
+            self.save(self.taboutput)
+            
+            # run morbidostat alorithm
+            self.morbidostat()
+            
+        # increment loop count
+        self.loop_count += 1
+
+        # call on_timer() every XX sec 
+        #t_timer=threading.Timer(sampling_rate, self.on_timer)
+        #t_timer.start()
+
+    # ----------------------------------------------------------------------------------------------------------------------------
+
+
+    ##
+    ## --- Callback functions   -----------------------------------------------------------------------------------------------------
+    ##
+    
+    def on_btn_start(self):
+        # switch state
+        self.system_running = not self.system_running
+
+        if self.system_running: 
+            #label = "STOP"
+            self.btn_start.setStyleSheet("font: 10pt bold; color: red; background-color: #C8C8C8; border-width: 2px")
+            print("##---------------------------------------------------------------")
+            print("##    Experiment Started Here    @ " + str(self.get_currtime()))
+            print("##---------------------------------------------------------------")
+        else:
+            #label = "START"
+            self.btn_start.setStyleSheet("font: 10pt bold; color: red; background-color: #E9E9E9")
+            print("##---------------------------------------------------------------")
+            print("##    Experiment Stopped Here    @ " + str(self.get_currtime()))
+            print("##---------------------------------------------------------------")
+        
+
+        # initialise plot data 
+        if self.system_running:
+            self.measure_OD()
+            #self.plot_data = np.zeros((1, 4))
+            self.plot_data = self.currOD.reshape(1,num_cham)
+            
+    def on_btn_sendcmd(self):
+        print("Sending command to arduino....")
+        # wash pumps
+        #self.tricon.wash_pump(ipump_speed,2)          
+        # send command to incubator
+        p_cmd = str(self.sendcmd_textctrl.text())
+        self.arduino.send_cmd(p_cmd)  
+
+       
+    def on_btn_pump(self):
+        # First of all, toggle state
+        self.btn_pump_state = not self.btn_pump_state
+        if self.btn_pump_state: 
+            print("PUMP: Turning waste pumps ON.")
+            self.btn_pump.setStyleSheet("font: bold; color: red; background-color: #C8C8C8")
+            self.arduino.pump_allon()
+        else:
+            print("PUMP: Turning waste pumps OFF.")
+            self.btn_pump.setStyleSheet("font: normal; color: black; background-color: #E9E9E9")
+            self.arduino.pump_alloff()
+
+
+                
+    def on_cbox_update(self, n):
+        if self.pump_cbox[n].checkState():
+            print("PUMP: Turning No.%d pumps ON." % int(n))
+        else:
+            print("PUMP: Turning No.%d pumps OFF." % int(n))
+            
+        self.arduino.pump_ctrl(n, self.pump_cbox[n].checkState())
+
+    def on_cbox_LEDsensor(self, n):
+        if self.LEDsensor_cbox[n].checkState():
+            print("LED/Sensor: Turning No.%d LED/sensor set ON." % int(n))
+        else:
+            print("LED/Sensor: Turning No.%d LED/sensor set OFF." % int(n))
+            
+        self.arduino2.pump_ctrl(shield_LEDsensor_pin[n], self.LEDsensor_cbox[n].checkState())
+
+
+    def on_btn_measinitvolt(self):
+        print("OD: measuring initial voltage....")
+        # measure voltage 
+        tmpVolt = self.arduino.poll()
+        tmpflasknum = int(self.sb_volt.value()) - 1
+        print "OD: measured initial voltage for Flask #%d: " % (tmpflasknum+1,) + str(tmpVolt[tmpflasknum*2:(tmpflasknum+1)*2])
+        self.initvolt0_textctrl.setText(str(tmpVolt[tmpflasknum*2]))
+        self.initvolt1_textctrl.setText(str(tmpVolt[tmpflasknum*2+1]))
+
+    def on_btn_setinitvolt(self):
+        print("OD: setting initial voltage....")
+        tmpflasknum = int(self.sb_volt.value()) - 1
+        self.initVolt[tmpflasknum*2]      = float(self.initvolt0_textctrl.text())
+        self.initVolt[tmpflasknum*2+1] = float(self.initvolt1_textctrl.text())
+        print("OD: initial voltages are set to %s" % str(self.initVolt[0:num_cham*2]))
+
+        # initialise pot data
+        self.plot_data = np.zeros((1, 4))
+
+    def on_sb_fanspeed(self):
+        self.arduino2.fan_ctrl(9, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(8, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(7, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(6, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(5, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(4, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(3, self.fanspeed_sb.value())
+        self.arduino2.fan_ctrl(2, self.fanspeed_sb.value())
+        #self.arduino2.fan_ctrl(44, self.fanspeed_sb.value())
+        #self.arduino2.fan_ctrl(46, self.fanspeed_sb.value())
+
+
+    def on_btn_ODthresh(self):
+        tmpflasknum = int(self.sb_ODthresh.value()) - 1
+        self.OD_thresh[tmpflasknum] = float(self.ODthresh_textctrl.text())
+        print "OD: OD threshold for flask #%d is set to %f" % (tmpflasknum, self.OD_thresh[tmpflasknum])
+        print "OD: Current OD thresholds", self.OD_thresh[0:num_cham] 
+
+
+
+
+
+# -------------------------------------------------------------------------------------------------------------------------------
+#    MAIN function 
+# -------------------------------------------------------------------------------------------------------------------------------
+if __name__ == '__main__':
+
+    app = QApplication(sys.argv)
+    form = Morbidostat()
+    form.show()
+    app.exec_()
+
+    # start measurement
+    #t_start=threading.Thread(target=turbidostat.on_timer)
+    #t_start.start()
+
+
