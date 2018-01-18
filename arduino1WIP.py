@@ -4,7 +4,8 @@ import time
 from matplotlib import pyplot as plt
 import threading 
 import datetime
-
+import subprocess 
+import csv
 ports = serial.tools.list_ports.comports()
 
 for port in ports:
@@ -15,7 +16,13 @@ for port in ports:
 # s
 plt.ion() # set plot to animated
 ser = serial.Serial(arduino_port, baudrate = 9600, timeout=1)
-ydata = [0] * 1000
+
+
+ODdata = []
+pump_nut = []
+pump_drug = [] 
+pump_waste = []
+timer = []
 # colour_data = ['k'] * 1000
 # ax1=plt.axes() 
 
@@ -75,36 +82,61 @@ def plotdata(ydata):
 
 
 start_time = get_currtime()          
-loop_count = 1
+loop_count = 0
 addmediafreq = 10
 avgnum = 5
 #morbidostat algorithm, set to trigger pumps and keep them on according to calibrated time
+outfile = "data - %d" % (start_time)
+def savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing):
+    
+    l = [ODdata,pump_nut, pump_drug,pump_waste,timing]
+    out = open(outfile, 'a')
+    with out as output:
+        writer = csv.writer(output, lineterminator='\n')
+        writer.writerow(l) 
+    ODdata = []
+    pump_nut = []
+    pump_drug = []
+    pump_waste = []
+    timing = []
+    return ODdata, pump_nut, pump_drug, pump_waste, timing
 
 
-def cycloresistron(loop_count, addmediafreq, avgnum, ydata, dp1ontime,mp1ontime,wp1ontime): 
+def cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontime, ODdata, pump_drug, pump_nut, pump_waste): 
 
-    if (loop_count % addmediafreq)==0:
-        if np.mean(ydata[-avgnum:-1]) >400:
+    if (loop_count % addmediafreq)==0 and loop_count>0:
+        if np.mean(ODdata[-avgnum:-1]) >400:
             pump_ctrl(drugpump1,1)
             threading.Timer(dp1ontime,pump_ctrl, args = (drugpump1,0)).start()
             threading.Timer(dp1ontime,pump_ctrl, args = (wastepump1,1)).start()
             threading.Timer(dp1ontime+wp1ontime,pump_ctrl, args = (wastepump1,0)).start()
+            pump_drug=1
+            pump_nut=0
+            pump_waste =1
             
         else: 
             pump_ctrl(mediapump1,1)
             threading.Timer(mp1ontime,pump_ctrl, args = (mediapump1,0)).start()
             threading.Timer(dp1ontime,pump_ctrl, args = (wastepump1,1)).start()
             threading.Timer(mp1ontime+ wp1ontime,pump_ctrl, args = (wastepump1,0)).start()
+            pump_nut =1
+            pump_drug=0
+            pump_waste =1
+    else:
+        pump_nut=0
+        pump_waste=0
+        pump_drug=0
+    return pump_drug, pump_nut, pump_waste
 
 
 #how many loops this should run for
 endloops =100 
 #recursive loop function thing
-def on_timer(loop_count, addmediafreq,avgnum,ydata, start_time, endloops, dp1ontime,mp1ontime,wp1ontime):
-
+def on_timer(loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timer):
+    timing = get_currtime() 
     #arduinoData  = str(np.round(np.random.rand()*50 + 950).astype(int))
     #measure OD from 1st channel only for know
-    arduinoData = measure(16)[0]
+    ODData = measure(16)[0]
     #arduinoData = ser.readline().decode('ascii')
     #print(data)
     #arduinoData=(measure(1).decode('ascii'))
@@ -116,23 +148,26 @@ def on_timer(loop_count, addmediafreq,avgnum,ydata, start_time, endloops, dp1ont
         arduinoData = 0
     print(arduinoData)
 
-    ydata.append(arduinoData) 
+ 
     #pump_ctrl(drugpump1,0)
     #pump_ctrl(mediapump1,0)
     #pump_ctrl(wastepump1,0)
-    cycloresistron(loop_count, addmediafreq, avgnum, ydata, dp1ontime,mp1ontime,wp1ontime)
+    pump_drug, pump_nut, pump_waste = cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontime, ODdata, pump_drug, pump_nut, pump_waste)
     loop_count += 1
     #run plot function for every iteration
-    plotdata(ydata)
+
+    ODdata, pump_nut, pump_drug, pump_waste, timing = savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing)
+
+    
 
     
     #we only want the morbidostat algorithm to run every 2 seconds, but this is not the way to do t
     if loop_count != endloops:
-        timerobject = threading.Timer(2, on_timer, args = (loop_count, addmediafreq,avgnum,ydata, start_time, endloops, dp1ontime,mp1ontime,wp1ontime))
+        timerobject = threading.Timer(2, on_timer, args = (loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timer))
         timerobject.start()
         print(loop_count)
     
 
-on_timer(loop_count, addmediafreq,avgnum,ydata, start_time, endloops, dp1ontime,mp1ontime,wp1ontime)
+on_timer(loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timer)
 
 
