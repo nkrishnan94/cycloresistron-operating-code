@@ -6,6 +6,7 @@ import threading
 import datetime
 import subprocess 
 import csv
+import os
 ports = serial.tools.list_ports.comports()
 
 for port in ports:
@@ -40,6 +41,7 @@ mp1ontime= 5/3.25
 dp1ontime= 5/3.35
 wp1ontime= 5/4.45
 
+OD_avg_length = 30
 #control pump
 def pump_ctrl(pnum, pstate):
     ser.flush() #flush before sending signal
@@ -86,9 +88,16 @@ loop_count = 0
 addmediafreq = 10
 avgnum = 5
 #morbidostat algorithm, set to trigger pumps and keep them on according to calibrated time
-outfile = "data - %d" % (start_time)
-def savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing):
-    
+
+outdir = "data-%d%.2d%.2d-%.2d%.2d" % (start_time.year, start_time.month, start_time.day, start_time.hour, start_time.minute)
+os.makedirs(outdir) 
+filesize = 10
+filenum = 0 
+def savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing,outdir,filenum, filesize):
+    if loop_count % filesize == 0:
+        filenum +=1
+     
+    outfile = "%s/%s.%d.csv" % (outdir, outdir, filenum)
     l = [ODdata,pump_nut, pump_drug,pump_waste,timing]
     out = open(outfile, 'a')
     with out as output:
@@ -99,13 +108,17 @@ def savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing):
     pump_drug = []
     pump_waste = []
     timing = []
-    return ODdata, pump_nut, pump_drug, pump_waste, timing
+    return ODdata, pump_nut, pump_drug, pump_waste, timing, filenum
 
 
-def cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontime, ODdata, pump_drug, pump_nut, pump_waste): 
-
+def cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontime, ODdata, pump_drug, pump_nut, pump_waste, avOD_buffer): 
+    avOD_buffer = np.append(avOD_buffer, ODdata)  
+    # then remove the first item in the array, i.e. the oldest 
+    avOD_buffer = np.delete(avOD_buffer, 0, axis=0)          
+    # calculate average for each flask
+    avOD = np.mean(avOD_buffer, axis=0)
     if (loop_count % addmediafreq)==0 and loop_count>0:
-        if np.mean(ODdata[-avgnum:-1]) >400:
+        if avOD >400:
             pump_ctrl(drugpump1,1)
             threading.Timer(dp1ontime,pump_ctrl, args = (drugpump1,0)).start()
             threading.Timer(dp1ontime,pump_ctrl, args = (wastepump1,1)).start()
@@ -126,48 +139,51 @@ def cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontim
         pump_nut=0
         pump_waste=0
         pump_drug=0
-    return pump_drug, pump_nut, pump_waste
+    return pump_drug, pump_nut, pump_waste, avOD_buffer
 
-
+avOD_buffer = np.zeros(OD_avg_length)
 #how many loops this should run for
 endloops =100 
 #recursive loop function thing
-def on_timer(loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timer):
+
+
+def on_timer(loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timing, avOD_buffer, outdir, filenum,filesize):
+
     timing = get_currtime() 
     #arduinoData  = str(np.round(np.random.rand()*50 + 950).astype(int))
     #measure OD from 1st channel only for know
-    ODData = measure(16)[0]
+    ODdata = measure(16)[0]
     #arduinoData = ser.readline().decode('ascii')
     #print(data)
     #arduinoData=(measure(1).decode('ascii'))
-    
-    #format data something something
-    if(len(arduinoData) > 0):
-        arduinoData = int(arduinoData)
-    else:
-        arduinoData = 0
-    print(arduinoData)
 
+    #format data something something
+    if(len(ODdata) > 0):
+        ODdata = int(ODdata)
+    else:
+        ODdata = 0
+    print(ODdata)
+    
  
     #pump_ctrl(drugpump1,0)
     #pump_ctrl(mediapump1,0)
     #pump_ctrl(wastepump1,0)
-    pump_drug, pump_nut, pump_waste = cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontime, ODdata, pump_drug, pump_nut, pump_waste)
+    pump_drug, pump_nut, pump_waste, avOD_buffer = cycloresistron(loop_count, addmediafreq, avgnum,dp1ontime,mp1ontime,wp1ontime, ODdata, pump_drug, pump_nut, pump_waste, avOD_buffer)
     loop_count += 1
     #run plot function for every iteration
 
-    ODdata, pump_nut, pump_drug, pump_waste, timing = savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing)
+    ODdata, pump_nut, pump_drug, pump_waste, timing, filenum = savefunc(loop_count, ODdata, pump_nut, pump_drug, pump_waste, timing,outdir,filenum,filesize)
 
     
 
     
     #we only want the morbidostat algorithm to run every 2 seconds, but this is not the way to do t
     if loop_count != endloops:
-        timerobject = threading.Timer(2, on_timer, args = (loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timer))
+        timerobject = threading.Timer(2, on_timer, args = (loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timing, avOD_buffer,outdir,filenum,filesize))
         timerobject.start()
-        print(loop_count)
+        print(filenum)
     
 
-on_timer(loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, timer)
+on_timer(loop_count, addmediafreq,avgnum, start_time, endloops, dp1ontime,mp1ontime,wp1ontime,ODdata, pump_drug, pump_nut, pump_waste, start_time, avOD_buffer,outdir,filenum,filesize)
 
 
